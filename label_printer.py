@@ -34,9 +34,9 @@ COL_VEJL = 7        # H  Vejledende priser
 COL_PRIS = 8        # I  Pris pr stk
 MIN_COLS = COL_PRIS + 1
 
-DRAW_CUT_LINE = True
+DRAW_CUT_LINE = False   # default for the "Skærelinje i midten" checkbox
 DISCLAIMER = "KØBT SOM BESET, UDEN RETURRET!"
-APP_VERSION = "3.2"   # also shown in the installer (build/installer-label-printer.iss)
+APP_VERSION = "4.0"   # also shown in the installer (build/installer-label-printer.iss)
 
 
 @dataclass
@@ -47,8 +47,10 @@ class Label:
     pris: int | None
     stk: int
     line: int               # 1-based row number in the pasted text
-    problems: list[str]
+    problems: list[str]     # any problem -> the row is incomplete and not printed
     bad_cols: list[int] = field(default_factory=list)   # columns to highlight in the GUI
+    warnings: list[str] = field(default_factory=list)   # printed anyway, just flagged
+    warn_cols: list[int] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------
@@ -82,7 +84,11 @@ def parse_vejl(text: str) -> int | None:
     return max(nums) if nums else None
 
 
-def format_dkk(value: int) -> str:
+def format_dkk(value: int | None) -> str:
+    """1699 -> '1.699,-'; None (no vejl. pris) -> '' so the label keeps its
+    caption but shows no number."""
+    if value is None:
+        return ""
     return f"{value:,}".replace(",", ".") + ",-"
 
 
@@ -112,22 +118,28 @@ def parse_rows(rows, per_stk: bool = False) -> list[Label]:
         bad_cols = []
         for ok, col, msg in [(varenr, COL_VARENR, "mangler varenummer"),
                              (navn, COL_NAVN, "mangler varenavn"),
-                             (vejl is not None, COL_VEJL, "mangler vejl. pris"),
                              (pris is not None, COL_PRIS, "mangler pris pr stk"),
                              (stk >= 1 or not per_stk, COL_STK, "STK skal være mindst 1")]:
             if not ok:
                 problems.append(msg)
                 bad_cols.append(col)
-        labels.append(Label(varenr, navn, vejl, pris, stk, line_no, problems, bad_cols))
+        warnings, warn_cols = [], []
+        if vejl is None:  # printed with an empty vejl. salgspris
+            warnings.append("ingen vejl. pris")
+            warn_cols.append(COL_VEJL)
+        labels.append(Label(varenr, navn, vejl, pris, stk, line_no, problems, bad_cols,
+                            warnings, warn_cols))
     return labels
 
 
 def expand(labels: list[Label], per_stk: bool = False) -> list[Label]:
-    """One entry per physical label: one per row by default, or one per
-    piece when per_stk is set (STK = 2 -> two labels)."""
+    """One entry per physical label. Incomplete rows (with problems) are
+    skipped. One label per row by default, or one per piece when per_stk is
+    set (STK = 2 -> two labels)."""
+    complete = [lab for lab in labels if not lab.problems]
     if not per_stk:
-        return list(labels)
-    return [lab for lab in labels for _ in range(lab.stk)]
+        return complete
+    return [lab for lab in complete for _ in range(lab.stk)]
 
 
 # --------------------------------------------------------------------------
@@ -371,7 +383,7 @@ def draw_label_big_price(c, x, y, w, h, label: Label):
     top = y + h
 
     c.setFont(FONT, 22)
-    c.drawCentredString(cx, top - Y_VEJL, f"Vejl. salgspris {format_dkk(label.vejl)}")
+    c.drawCentredString(cx, top - Y_VEJL, f"Vejl. salgspris {format_dkk(label.vejl)}".strip())
 
     price = format_dkk(label.pris)
     size = _fit_size(price, FONT_BOLD, PRICE_SIZE, 50, width)
@@ -427,7 +439,7 @@ def default_layout() -> str:
 
 
 def build_pdf(labels: list[Label], path, layout: str = DEFAULT_LAYOUT,
-              per_stk: bool = False) -> int:
+              per_stk: bool = False, cut_line: bool = DRAW_CUT_LINE) -> int:
     """Write the PDF; returns the number of pages."""
     register_fonts()
     draw = LAYOUTS[layout][1]
@@ -445,7 +457,7 @@ def build_pdf(labels: list[Label], path, layout: str = DEFAULT_LAYOUT,
         draw(c, 0, half, page_w, half, pair[0])            # top half
         if len(pair) > 1:
             draw(c, 0, 0, page_w, half, pair[1])           # bottom half
-        if DRAW_CUT_LINE:
+        if cut_line:
             c.saveState()
             c.setStrokeGray(0.75)
             c.setLineWidth(0.5)
@@ -495,9 +507,18 @@ UI_FONT = "Segoe UI"
 C = {  # matches the sv-ttk dark theme used by Label Miner
     "bg": "#1c1c1c", "card": "#262626", "table": "#202020", "header": "#2d2d2d",
     "grid": "#3a3a3a", "fg": "#fafafa", "muted": "#8b8b8b", "faint": "#5f5f5f",
-    "accent": "#57c8ff", "ok": "#6fcf97", "bad": "#ff8a8a", "bad_bg": "#5a2828",
-    "select": "#1f4a63",
+    "accent": "#57c8ff", "ok": "#6fcf97", "bad": "#ff8a8a", "bad_bg": "#8a3030",
+    "bad_row": "#4a2323", "warn": "#f2c94c", "warn_bg": "#4d4220", "select": "#1f4a63",
 }
+# Danish right-click menu for the table.
+SHEET_MENU_LABELS = dict(
+    cut_label="Klip", copy_label="Kopiér", copy_plain_label="Kopiér som tekst",
+    paste_label="Indsæt", delete_label="Slet indhold", clear_contents_label="Slet indhold",
+    delete_rows_label="Slet rækker", insert_rows_above_label="Indsæt rækker over",
+    insert_rows_below_label="Indsæt rækker under", insert_row_label="Indsæt række",
+    select_all_label="Markér alt", undo_label="Fortryd", redo_label="Annullér fortryd",
+    edit_cell_label="Redigér celle",
+)
 
 
 class LabelPrinterApp:
@@ -509,13 +530,11 @@ class LabelPrinterApp:
         self.tk, self.ttk = tk, ttk
         self.root = root
         self.labels: list[Label] = []
-        self.bad_cells: set[tuple[int, int]] = set()
-        self.bad_rows: set[int] = set()
         self.preview_image = None
         self.save_dir = str(Path.home() / "Desktop")
         self._validate_job = self._preview_job = None
-        self._problem_targets = []
         self.per_stk_var = tk.BooleanVar(value=False)   # default: one label per row
+        self.cut_line_var = tk.BooleanVar(value=DRAW_CUT_LINE)   # default: no cut line
 
         root.title(f"Label Printer {APP_VERSION}")
         root.geometry("1360x800")
@@ -536,15 +555,22 @@ class LabelPrinterApp:
         # ---- header -------------------------------------------------------
         header = ttk.Frame(root, padding=(20, 16, 20, 8))
         header.pack(fill="x")
+        # Buttons are packed before the titles so a narrow window squeezes the
+        # text, never the buttons.
+        buttons = ttk.Frame(header)
+        buttons.pack(side="right", anchor="n")
+        ttk.Button(buttons, text="Indsæt fra udklipsholder", command=self.paste_replace
+                   ).pack(side="left", padx=(0, 8))
+        ttk.Button(buttons, text="Ryd tabel", command=self.clear).pack(side="left")
         titles = ttk.Frame(header)
-        titles.pack(side="left")
+        titles.pack(side="left", fill="x", expand=True)
         ttk.Label(titles, text="Label Printer", font=(UI_FONT, 18, "bold")).pack(anchor="w")
         ttk.Label(titles, foreground=C["muted"],
-                  text="Kopiér rækkerne i Google Sheets (marker fra kolonne A) og indsæt dem i "
-                       "tabellen med Ctrl+V. Du kan rette direkte i cellerne.").pack(anchor="w")
-        ttk.Button(header, text="Ryd tabel", command=self.clear).pack(side="right")
-        ttk.Button(header, text="Indsæt fra udklipsholder", command=self.paste_replace
-                   ).pack(side="right", padx=8)
+                  text="Kopiér rækkerne i Google Sheets (fra kolonne A) og indsæt med Ctrl+V. "
+                       "Du kan rette direkte i cellerne.").pack(anchor="w")
+        ttk.Label(titles, foreground=C["muted"],
+                  text="Slet rækker: klik på rækkenumrene (træk eller Shift-klik for flere) og "
+                       "tryk Delete.  Markerede celler tømmes med Delete.").pack(anchor="w")
 
         # ---- body: sheet + sidebar ---------------------------------------
         body = ttk.Frame(root, padding=(20, 8, 20, 20))
@@ -561,11 +587,30 @@ class LabelPrinterApp:
         )
         self._style_sheet()
         self.sheet.enable_bindings("all")
-        self.sheet.disable_bindings("edit_header", "edit_index", "rename_columns")
+        # Anything that adds, removes or reorders *columns* would shift the
+        # pasted data out of the Label Miner column order, so switch it off.
+        for binding in ("edit_header", "edit_index", "rename_columns", "rc_insert_column",
+                        "rc_delete_column", "column_drag_and_drop", "sort_cells", "sort_row",
+                        "sort_column", "sort_rows", "sort_columns"):
+            try:
+                self.sheet.disable_bindings(binding)
+            except Exception:
+                pass
+        try:
+            self.sheet.set_options(**SHEET_MENU_LABELS, redraw=False)
+        except Exception:
+            pass
         self.sheet.grid(row=0, column=0, sticky="nsew")
         self.sheet.bind("<<SheetModified>>", lambda e: self._schedule_validate())
         self.sheet.bind("<<SheetSelect>>", lambda e: self._schedule_preview())
         root.bind_all("<Control-v>", self._global_paste, add="+")
+        # Delete/Backspace: remove whole selected rows. Our tag is put in front
+        # of tksheet's own bindings on its canvases so it gets the key first;
+        # with only cells selected it falls through and tksheet empties them.
+        for widget in (self.sheet.MT, self.sheet.RI, self.sheet.CH, self.sheet.TL):
+            widget.bindtags(("LabelPrinterRows",) + widget.bindtags())
+        root.bind_class("LabelPrinterRows", "<Delete>", self._on_delete_key)
+        root.bind_class("LabelPrinterRows", "<BackSpace>", self._on_delete_key)
 
         self._build_sidebar(body)
         self.sheet.select_cell(0, 0)
@@ -646,30 +691,37 @@ class LabelPrinterApp:
             stats.columnconfigure(i, weight=1, uniform="stat")
             var = tk.StringVar(value="0")
             self.stat_vars[key] = var
-            label(stats, textvariable=var, font=(UI_FONT, 22, "bold"),
+            label(stats, textvariable=var, font=(UI_FONT, 20, "bold"),
                   fg=C["accent"] if key == "labels" else C["fg"]).grid(row=0, column=i, sticky="w")
             label(stats, text=caption, fg=C["muted"], font=(UI_FONT, 9)
                   ).grid(row=1, column=i, sticky="w")
 
-        tk.Frame(side, bg=C["grid"], height=1).grid(row=1, column=0, sticky="ew", pady=12)
+        tk.Frame(side, bg=C["grid"], height=1).grid(row=1, column=0, sticky="ew", pady=8)
 
         self.status_label = label(side, font=(UI_FONT, 11, "bold"), wraplength=340)
         self.status_label.grid(row=2, column=0, sticky="ew")
-        self.problem_list = tk.Listbox(
-            side, height=3, activestyle="none", borderwidth=0, highlightthickness=0,
-            bg=C["card"], fg=C["bad"], selectbackground=C["select"], selectforeground=C["fg"],
-            font=(UI_FONT, 10), cursor="hand2")
-        self.problem_list.grid(row=3, column=0, sticky="ew", pady=(6, 0))
-        self.problem_list.bind("<<ListboxSelect>>", self._jump_to_problem)
+        # Colour legend for the table highlights; only the entries that apply
+        # to the current data are shown.
+        legend = tk.Frame(side, bg=C["card"])
+        legend.grid(row=3, column=0, sticky="ew", pady=(6, 0))
+        self.legend_rows = {}
+        for i, key in enumerate(("bad_row", "warn_bg")):
+            row = tk.Frame(legend, bg=C["card"])
+            row.grid(row=i, column=0, sticky="w")
+            tk.Frame(row, bg=C[key], width=13, height=13, highlightthickness=1,
+                     highlightbackground=C["grid"]).pack(side="left", padx=(0, 8))
+            text = label(row, fg=C["fg"], font=(UI_FONT, 9))
+            text.pack(side="left")
+            self.legend_rows[key] = (row, text)
 
         self.preview_title = label(side, fg=C["muted"], font=(UI_FONT, 9, "bold"))
-        self.preview_title.grid(row=4, column=0, sticky="ew", pady=(10, 6))
+        self.preview_title.grid(row=4, column=0, sticky="ew", pady=(8, 4))
         self.preview = tk.Label(side, bg=C["table"], fg=C["muted"], font=(UI_FONT, 10),
-                                height=12, text="Ingen gyldige rækker endnu.")
+                                height=11, text="Ingen gyldige rækker endnu.")
         self.preview.grid(row=5, column=0, sticky="new")
 
         layout_row = tk.Frame(side, bg=C["card"])
-        layout_row.grid(row=7, column=0, sticky="ew", pady=(12, 0))
+        layout_row.grid(row=7, column=0, sticky="ew", pady=(8, 0))
         layout_row.columnconfigure(1, weight=1)
         label(layout_row, text="LAYOUT", fg=C["muted"], font=(UI_FONT, 9, "bold")
               ).grid(row=0, column=0, sticky="w", padx=(0, 12))
@@ -686,12 +738,17 @@ class LabelPrinterApp:
         self.default_btn.bind("<Button-1>", lambda e: self._make_default())
         self._update_default_button()
 
-        tk.Checkbutton(
-            side, variable=self.per_stk_var, command=self._toggle_per_stk,
-            text="Én etiket pr. stk (brug STK-kolonnen)", anchor="w",
-            bg=C["card"], fg=C["fg"], activebackground=C["card"], activeforeground=C["fg"],
-            selectcolor=C["table"], highlightthickness=0, bd=0, font=(UI_FONT, 10),
-            cursor="hand2").grid(row=8, column=0, sticky="ew", pady=(4, 0))
+        def checkbox(text, variable, command, row):
+            tk.Checkbutton(
+                layout_row, variable=variable, command=command, text=text, anchor="w",
+                bg=C["card"], fg=C["fg"], activebackground=C["card"], activeforeground=C["fg"],
+                selectcolor=C["table"], highlightthickness=0, bd=0, font=(UI_FONT, 10),
+                cursor="hand2").grid(row=row, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        # The first shares its line with the "Standard-layout" link.
+        checkbox("Én etiket pr. stk", self.per_stk_var, self._toggle_per_stk, 1)
+        checkbox("Skærelinje i midten", self.cut_line_var, None, 2)
+        self.default_btn.lift()
         side.rowconfigure(9, weight=1)
 
         self.generate_btn = self.ttk.Button(side, text="Generér PDF", style="Big.Accent.TButton",
@@ -727,6 +784,34 @@ class LabelPrinterApp:
         self.sheet.select_cell(0, 0)
         self.validate()
 
+    def _on_delete_key(self, event):
+        """Delete/Backspace in the table. Whole rows selected (via the row
+        numbers) -> remove those rows. Otherwise Delete falls through to
+        tksheet, which empties the selected cells; Backspace does the same."""
+        if self.sheet.get_selected_rows():
+            self.delete_selected_rows()
+            return "break"
+        if event.keysym == "BackSpace" and self.sheet.get_selected_cells():
+            self.sheet.MT.delete_key()
+            return "break"
+        return None
+
+    def delete_selected_rows(self):
+        """Remove the whole rows that are selected. Undo with Ctrl+Z."""
+        rows = set(self.sheet.get_selected_rows())
+        if not rows:
+            return
+        self.sheet.delete_rows(sorted(rows), undo=True, redraw=False)
+        self.sheet.deselect("all")
+        missing = EMPTY_ROWS - self.sheet.get_total_rows()
+        if missing > 0:  # keep some empty rows to paste into
+            # idx=None appends; tksheet reads idx="end" as something else
+            # entirely and inserts thousands of rows.
+            self.sheet.insert_rows(self._blank_rows(missing), idx=None, undo=False,
+                                   create_selections=False, redraw=False)
+        self.sheet.select_cell(min(min(rows), self.sheet.get_total_rows() - 1), 0)
+        self.validate()
+
     # ---- validation ------------------------------------------------------
     def _schedule_validate(self):
         if self._validate_job:
@@ -737,20 +822,22 @@ class LabelPrinterApp:
         self._validate_job = None
         self.labels = parse_rows(self.sheet.get_sheet_data(), self.per_stk)
         bad = [lab for lab in self.labels if lab.problems]
+        warned = [lab for lab in self.labels if lab.warnings and not lab.problems]
 
-        new_cells = {(lab.line - 1, col) for lab in bad for col in lab.bad_cols}
-        new_rows = {lab.line - 1 for lab in bad}
-        stale = self.bad_cells - new_cells
-        if stale:
-            self.sheet.dehighlight_cells(cells=list(stale), redraw=False)
-        for row in self.bad_rows - new_rows:
-            self.sheet.dehighlight_cells(row=row, canvas="index", redraw=False)
-        if new_cells:
-            self.sheet.highlight_cells(cells=list(new_cells), bg=C["bad_bg"], redraw=False)
-        for row in new_rows:
-            self.sheet.highlight_cells(row=row, canvas="index", bg=C["bad_bg"], fg=C["fg"],
-                                       redraw=False)
-        self.bad_cells, self.bad_rows = new_cells, new_rows
+        # Redraw all row/cell highlights from scratch (rows may have been
+        # inserted or deleted since last time). Column styling is separate
+        # and survives this.
+        self.sheet.dehighlight_rows("all", redraw=False)
+        self.sheet.dehighlight_cells(row="all", redraw=False)
+        if bad:  # incomplete row: whole row red, the missing cells stronger
+            self.sheet.highlight_rows([lab.line - 1 for lab in bad], bg=C["bad_row"],
+                                      redraw=False)
+            cells = [(lab.line - 1, col) for lab in bad for col in lab.bad_cols]
+            if cells:
+                self.sheet.highlight_cells(cells=cells, bg=C["bad_bg"], redraw=False)
+        warn_cells = [(lab.line - 1, col) for lab in warned for col in lab.warn_cols]
+        if warn_cells:
+            self.sheet.highlight_cells(cells=warn_cells, bg=C["warn_bg"], redraw=False)
         self.sheet.refresh()
 
         n = len(expand(self.labels, self.per_stk))
@@ -758,32 +845,34 @@ class LabelPrinterApp:
         self.stat_vars["labels"].set(str(n))
         self.stat_vars["pages"].set(str((n + 1) // 2))
 
-        self.problem_list.delete(0, "end")
-        self._problem_targets = []
-        for lab in bad:
-            self.problem_list.insert("end", f"Række {lab.line}:  {', '.join(lab.problems)}")
-            self._problem_targets.append((lab.line - 1, lab.bad_cols[0] if lab.bad_cols else 0))
+        legend = {
+            "bad_row": (f"Ufuldstændig række – udskrives ikke ({len(bad)})", bool(bad)),
+            "warn_bg": (f"Ingen vejl. pris – tom på etiketten ({len(warned)})",
+                        bool(warned)),
+        }
+        for key, (text, show) in legend.items():
+            row, text_label = self.legend_rows[key]
+            text_label.configure(text=text)
+            if show:
+                row.grid()
+            else:
+                row.grid_remove()
 
         if not self.labels:
             self._set_status("Indsæt rækker for at komme i gang.", C["muted"])
+        elif n == 0:
+            self._set_status("Ingen komplette rækker – der er intet at udskrive.", C["bad"])
         elif bad:
-            self._set_status(f"{len(bad)} række{'r' if len(bad) > 1 else ''} skal rettes:", C["bad"])
+            self._set_status(f"✓  Klar – {len(bad)} række{'r' if len(bad) > 1 else ''} "
+                             "springes over", C["warn"])
         else:
             self._set_status("✓  Klar til udskrift", C["ok"])
-        self.generate_btn.state(["!disabled"] if self.labels and not bad else ["disabled"])
+        self.generate_btn.state(["!disabled"] if n else ["disabled"])
         self._schedule_preview()
 
     def _set_status(self, text, color):
         self.status_label.configure(text=text, fg=color)
 
-    def _jump_to_problem(self, _event):
-        sel = self.problem_list.curselection()
-        if not sel:
-            return
-        row, col = self._problem_targets[sel[0]]
-        self.sheet.see(row, col)
-        self.sheet.select_cell(row, col)
-        self.sheet.focus_set()
 
     # ---- preview ---------------------------------------------------------
     def _schedule_preview(self):
@@ -800,11 +889,11 @@ class LabelPrinterApp:
         if label is None or label.problems:
             label = next((lab for lab in self.labels if not lab.problems), None)
         if label is None:
-            self.preview.configure(image="", text="Ingen gyldige rækker endnu.", height=12)
+            self.preview.configure(image="", text="Ingen gyldige rækker endnu.", height=11)
             self.preview_title.configure(text="FORHÅNDSVISNING")
             return
         self.preview_title.configure(text=f"FORHÅNDSVISNING  ·  RÆKKE {label.line}")
-        image = render_label_image(label, 330, self.layout)
+        image = render_label_image(label, 290, self.layout)
         if image is None:
             self.preview.configure(image="", text="Installer pypdfium2 for forhåndsvisning.")
             return
@@ -852,7 +941,8 @@ class LabelPrinterApp:
         if not path:
             return
         try:
-            pages = build_pdf(self.labels, path, self.layout, self.per_stk)
+            pages = build_pdf(self.labels, path, self.layout, self.per_stk,
+                              bool(self.cut_line_var.get()))
         except PermissionError:
             messagebox.showerror("Label Printer",
                                  "Kunne ikke gemme filen – er den åben i en PDF-læser?")
@@ -874,6 +964,8 @@ def main():
     parser.add_argument("--paste", help="tab-separated file with pasted rows (skips the GUI)")
     parser.add_argument("--out", default="etiketter.pdf")
     parser.add_argument("--layout", default=None, choices=list(LAYOUTS))
+    parser.add_argument("--cut-line", action="store_true",
+                        help="draw the dashed cut line across the middle of each page")
     parser.add_argument("--per-stk", action="store_true",
                         help="one label per piece (STK) instead of one per row")
     args = parser.parse_args()
@@ -881,12 +973,16 @@ def main():
         run_gui()
         return
     labels = parse_paste(Path(args.paste).read_text(encoding="utf-8"), args.per_stk)
-    bad = [lab for lab in labels if lab.problems]
-    for lab in bad:
-        print(f"linje {lab.line}: {', '.join(lab.problems)}", file=sys.stderr)
-    if bad:
+    for lab in labels:
+        if lab.problems:
+            print(f"linje {lab.line} springes over: {', '.join(lab.problems)}", file=sys.stderr)
+        elif lab.warnings:
+            print(f"linje {lab.line}: {', '.join(lab.warnings)}", file=sys.stderr)
+    if not expand(labels, args.per_stk):
+        print("ingen komplette rækker -- intet at udskrive", file=sys.stderr)
         sys.exit(1)
-    pages = build_pdf(labels, args.out, args.layout or default_layout(), args.per_stk)
+    pages = build_pdf(labels, args.out, args.layout or default_layout(), args.per_stk,
+                      args.cut_line)
     print(f"{len(expand(labels, args.per_stk))} etiketter, {pages} sider -> {args.out}")
 
 
