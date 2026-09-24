@@ -213,13 +213,189 @@ def draw_label_classic(c, x, y, w, h, label: Label):
     c.drawRightString(right, top - Y_VARENR, label.varenr)
 
 
-LAYOUTS = {"classic": draw_label_classic}
+def split_name(navn: str) -> tuple[str, str]:
+    """'Balo spisebord, egetræ | butterfly udtræk | 190/290x95 Eg'
+    -> ('Balo spisebord, egetræ', 'butterfly udtræk · 190/290x95 Eg').
+    Names without ' | ' have no reliable split point and stay whole."""
+    parts = [p.strip() for p in navn.split("|") if p.strip()]
+    if len(parts) < 2:
+        return navn.strip(), ""
+    return parts[0], " · ".join(parts[1:])
 
 
-def build_pdf(labels: list[Label], path, layout: str = "classic") -> int:
+def _fit_lines(text, font, size, min_size, width, max_lines=2):
+    """Keep one line by shrinking down to min_size; beyond that wrap at
+    min_size (and keep shrinking only if it still needs > max_lines)."""
+    fitted = _fit_size(text, font, size, min_size, width)
+    if pdfmetrics.stringWidth(text, font, fitted) <= width:
+        return fitted, [text]
+    size = min_size
+    lines = _wrap(text, font, size, width)
+    while len(lines) > max_lines and size > 10:
+        size -= 0.5
+        lines = _wrap(text, font, size, width)
+    return size, lines
+
+
+def _draw_lines(c, lines, font, size, x, y_top, leading, align="left"):
+    """Draw lines starting at baseline y_top (page coords), going down.
+    Returns the baseline of the last line."""
+    c.setFont(font, size)
+    draw = {"left": c.drawString, "center": c.drawCentredString,
+            "right": c.drawRightString}[align]
+    y_line = y_top
+    for i, line in enumerate(lines):
+        y_line = y_top - i * leading
+        draw(x, y_line, line)
+    return y_line
+
+
+def draw_label_classic_clean(c, x, y, w, h, label: Label):
+    """Klassisk, but the name is split at ' | ': the product in bold on the
+    first line, the variant details (size, colour, ...) smaller underneath.
+    Every label gets the same name size unless a name really doesn't fit."""
+    MARGIN_X = 20 * mm
+    PRICE_SIZE = 45
+    TITLE_SIZE, TITLE_MIN = 24, 20
+    DETAIL_SIZE, DETAIL_MIN = 20, 15
+    TEXT_SIZE = 24
+    Y_VEJL, Y_VORES = 34 * mm, 58 * mm
+    Y_NAME_TOP = 76 * mm          # first name baseline
+    Y_DISCLAIMER = 106 * mm
+    Y_VARENR = 128 * mm
+
+    left, right = x + MARGIN_X, x + w - MARGIN_X
+    width = right - left
+    top = y + h
+
+    for caption, value, font, baseline in [("Vejl. salgspris:", label.vejl, FONT, Y_VEJL),
+                                           ("Vores pris:", label.pris, FONT_BOLD, Y_VORES)]:
+        price = format_dkk(value)
+        size = PRICE_SIZE
+        while size > 20 and (pdfmetrics.stringWidth(caption, font, size)
+                             + pdfmetrics.stringWidth(price, font, size) + 10 * mm) > width:
+            size -= 1
+        c.setFont(font, size)
+        c.drawString(left, top - baseline, caption)
+        c.drawRightString(right, top - baseline, price)
+
+    title, details = split_name(label.navn)
+    t_size, t_lines = _fit_lines(title, FONT_BOLD, TITLE_SIZE, TITLE_MIN, width)
+    d_size, d_lines = (_fit_lines(details, FONT, DETAIL_SIZE, DETAIL_MIN, width)
+                       if details else (DETAIL_SIZE, []))
+    total = len(t_lines) + len(d_lines)
+    # Lift the block a little when it runs to 3 lines so it clears the disclaimer.
+    y_first = top - Y_NAME_TOP + max(0, total - 2) * 4 * mm
+    last = _draw_lines(c, t_lines, FONT_BOLD, t_size, left, y_first, t_size * 1.15)
+    if d_lines:
+        _draw_lines(c, d_lines, FONT, d_size, left, last - d_size * 1.35, d_size * 1.15)
+
+    c.setFont(FONT, TEXT_SIZE)
+    c.drawString(left, top - Y_DISCLAIMER, DISCLAIMER)
+    c.drawRightString(right, top - Y_VARENR, label.varenr)
+
+
+def draw_label_modern(c, x, y, w, h, label: Label):
+    """Product name as the headline, our price as the big number, the
+    disclaimer in a ruled footer together with the varenummer."""
+    MARGIN_X = 18 * mm
+    TITLE_SIZE, TITLE_MIN = 34, 26
+    DETAIL_SIZE, DETAIL_MIN = 19, 14
+    Y_TITLE = 30 * mm
+    Y_VEJL = 72 * mm
+    Y_CAPTION, Y_PRICE = 84 * mm, 110 * mm
+    PRICE_SIZE = 80
+    Y_RULE, Y_FOOTER = 120 * mm, 130 * mm
+
+    left, right = x + MARGIN_X, x + w - MARGIN_X
+    width = right - left
+    top = y + h
+
+    title, details = split_name(label.navn)
+    t_size, t_lines = _fit_lines(title, FONT_BOLD, TITLE_SIZE, TITLE_MIN, width)
+    last = _draw_lines(c, t_lines, FONT_BOLD, t_size, left, top - Y_TITLE, t_size * 1.1)
+    if details:
+        d_size, d_lines = _fit_lines(details, FONT, DETAIL_SIZE, DETAIL_MIN, width)
+        c.setFillGray(0.3)
+        _draw_lines(c, d_lines, FONT, d_size, left, last - d_size * 1.5, d_size * 1.15)
+        c.setFillGray(0)
+
+    c.setFont(FONT, 22)
+    c.drawString(left, top - Y_VEJL, "Vejl. salgspris")
+    c.drawRightString(right, top - Y_VEJL, format_dkk(label.vejl))
+
+    c.setFont(FONT_BOLD, 14)
+    c.drawString(left, top - Y_CAPTION, "VORES PRIS")
+    price = format_dkk(label.pris)
+    size = _fit_size(price, FONT_BOLD, PRICE_SIZE, 40, width)
+    c.setFont(FONT_BOLD, size)
+    c.drawString(left, top - Y_PRICE, price)
+
+    c.setLineWidth(1.2)
+    c.line(left, top - Y_RULE, right, top - Y_RULE)
+    c.setFont(FONT_BOLD, 17)
+    c.drawString(left, top - Y_FOOTER, DISCLAIMER)
+    c.setFont(FONT, 17)
+    c.drawRightString(right, top - Y_FOOTER, f"Varenr. {label.varenr}")
+
+
+def draw_label_big_price(c, x, y, w, h, label: Label):
+    """Centred, price-first: readable from across the showroom."""
+    MARGIN_X = 18 * mm
+    Y_VEJL = 24 * mm
+    Y_PRICE, PRICE_SIZE = 62 * mm, 100
+    Y_SAVE = 76 * mm
+    Y_TITLE = 94 * mm
+    TITLE_SIZE, TITLE_MIN = 22, 18
+    DETAIL_SIZE, DETAIL_MIN = 15, 12
+    Y_DISCLAIMER, Y_VARENR = 126 * mm, 136 * mm
+
+    left, right = x + MARGIN_X, x + w - MARGIN_X
+    width = right - left
+    cx = x + w / 2
+    top = y + h
+
+    c.setFont(FONT, 22)
+    c.drawCentredString(cx, top - Y_VEJL, f"Vejl. salgspris {format_dkk(label.vejl)}")
+
+    price = format_dkk(label.pris)
+    size = _fit_size(price, FONT_BOLD, PRICE_SIZE, 50, width)
+    c.setFont(FONT_BOLD, size)
+    c.drawCentredString(cx, top - Y_PRICE, price)
+
+    if label.vejl and label.pris and label.vejl > label.pris:
+        c.setFont(FONT_BOLD, 18)
+        c.drawCentredString(cx, top - Y_SAVE, f"Du sparer {format_dkk(label.vejl - label.pris)}")
+
+    title, details = split_name(label.navn)
+    t_size, t_lines = _fit_lines(title, FONT_BOLD, TITLE_SIZE, TITLE_MIN, width)
+    last = _draw_lines(c, t_lines, FONT_BOLD, t_size, cx, top - Y_TITLE, t_size * 1.15, "center")
+    if details:
+        d_size, d_lines = _fit_lines(details, FONT, DETAIL_SIZE, DETAIL_MIN, width)
+        c.setFillGray(0.3)
+        _draw_lines(c, d_lines, FONT, d_size, cx, last - d_size * 1.4, d_size * 1.15, "center")
+        c.setFillGray(0)
+
+    c.setFont(FONT_BOLD, 16)
+    c.drawCentredString(cx, top - Y_DISCLAIMER, DISCLAIMER)
+    c.setFont(FONT, 12)
+    c.drawRightString(right, top - Y_VARENR, label.varenr)
+
+
+# key -> (name shown in the GUI, draw function). The first entry is the default.
+LAYOUTS = {
+    "classic": ("Klassisk", draw_label_classic),
+    "classic_clean": ("Klassisk – pæne navne", draw_label_classic_clean),
+    "modern": ("Moderne", draw_label_modern),
+    "big_price": ("Stor pris", draw_label_big_price),
+}
+DEFAULT_LAYOUT = "classic"
+
+
+def build_pdf(labels: list[Label], path, layout: str = DEFAULT_LAYOUT) -> int:
     """Write the PDF; returns the number of pages."""
     register_fonts()
-    draw = LAYOUTS[layout]
+    draw = LAYOUTS[layout][1]
     page_w, page_h = A4
     half = page_h / 2
     items = expand(labels)
@@ -248,7 +424,7 @@ def build_pdf(labels: list[Label], path, layout: str = "classic") -> int:
 # Preview rendering (optional: needs pypdfium2 + Pillow)
 # --------------------------------------------------------------------------
 
-def render_label_image(label: Label, width_px: int, layout: str = "classic"):
+def render_label_image(label: Label, width_px: int, layout: str = DEFAULT_LAYOUT):
     """One label as a PIL image, or None if pypdfium2 isn't installed."""
     try:
         import pypdfium2
@@ -258,7 +434,7 @@ def render_label_image(label: Label, width_px: int, layout: str = "classic"):
     page_w, page_h = A4[0], A4[1] / 2
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=(page_w, page_h))
-    LAYOUTS[layout](c, 0, 0, page_w, page_h, label)
+    LAYOUTS[layout][1](c, 0, 0, page_w, page_h, label)
     c.showPage()
     c.save()
     pdf = pypdfium2.PdfDocument(buf.getvalue())
@@ -441,11 +617,24 @@ class LabelPrinterApp:
         self.preview.grid(row=5, column=0, sticky="new")
         label(side, text="Klik på en række for at se dens etiket.", fg=C["faint"],
               font=(UI_FONT, 9)).grid(row=6, column=0, sticky="ew", pady=(6, 0))
-        side.rowconfigure(7, weight=1)
+
+        layout_row = tk.Frame(side, bg=C["card"])
+        layout_row.grid(row=7, column=0, sticky="ew", pady=(14, 0))
+        layout_row.columnconfigure(1, weight=1)
+        label(layout_row, text="LAYOUT", fg=C["muted"], font=(UI_FONT, 9, "bold")
+              ).grid(row=0, column=0, sticky="w", padx=(0, 12))
+        self.layout_names = {name: key for key, (name, _) in LAYOUTS.items()}
+        self.layout_var = tk.StringVar(value=LAYOUTS[DEFAULT_LAYOUT][0])
+        combo = self.ttk.Combobox(layout_row, textvariable=self.layout_var, state="readonly",
+                                  values=list(self.layout_names))
+        combo.grid(row=0, column=1, sticky="ew")
+        combo.bind("<<ComboboxSelected>>", lambda e: (combo.selection_clear(),
+                                                      self._schedule_preview()))
+        side.rowconfigure(8, weight=1)
 
         self.generate_btn = self.ttk.Button(side, text="Generér PDF", style="Big.Accent.TButton",
                                             command=self.generate)
-        self.generate_btn.grid(row=8, column=0, sticky="ew")
+        self.generate_btn.grid(row=9, column=0, sticky="ew")
 
     @staticmethod
     def _blank_rows(n):
@@ -553,13 +742,17 @@ class LabelPrinterApp:
             self.preview_title.configure(text="FORHÅNDSVISNING")
             return
         self.preview_title.configure(text=f"FORHÅNDSVISNING  ·  RÆKKE {label.line}")
-        image = render_label_image(label, 330)
+        image = render_label_image(label, 330, self.layout)
         if image is None:
             self.preview.configure(image="", text="Installer pypdfium2 for forhåndsvisning.")
             return
         from PIL import ImageTk
         self.preview_image = ImageTk.PhotoImage(image)
         self.preview.configure(image=self.preview_image, text="", height=0)
+
+    @property
+    def layout(self):
+        return self.layout_names.get(self.layout_var.get(), DEFAULT_LAYOUT)
 
     # ---- output ----------------------------------------------------------
     def generate(self):
@@ -570,7 +763,7 @@ class LabelPrinterApp:
         if not path:
             return
         try:
-            pages = build_pdf(self.labels, path)
+            pages = build_pdf(self.labels, path, self.layout)
         except PermissionError:
             messagebox.showerror("Label Printer",
                                  "Kunne ikke gemme filen – er den åben i en PDF-læser?")
@@ -591,6 +784,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--paste", help="tab-separated file with pasted rows (skips the GUI)")
     parser.add_argument("--out", default="etiketter.pdf")
+    parser.add_argument("--layout", default=DEFAULT_LAYOUT, choices=list(LAYOUTS))
     args = parser.parse_args()
     if not args.paste:
         run_gui()
@@ -601,7 +795,7 @@ def main():
         print(f"linje {lab.line}: {', '.join(lab.problems)}", file=sys.stderr)
     if bad:
         sys.exit(1)
-    pages = build_pdf(labels, args.out)
+    pages = build_pdf(labels, args.out, args.layout)
     print(f"{len(expand(labels))} etiketter, {pages} sider -> {args.out}")
 
 
