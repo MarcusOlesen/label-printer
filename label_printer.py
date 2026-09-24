@@ -36,7 +36,7 @@ MIN_COLS = COL_PRIS + 1
 
 DRAW_CUT_LINE = True
 DISCLAIMER = "KØBT SOM BESET, UDEN RETURRET!"
-APP_VERSION = "3.1"   # also shown in the installer (build/installer-label-printer.iss)
+APP_VERSION = "3.2"   # also shown in the installer (build/installer-label-printer.iss)
 
 
 @dataclass
@@ -55,13 +55,16 @@ class Label:
 # Parsing
 # --------------------------------------------------------------------------
 
-_NUMBER_RE = re.compile(r"\d{1,3}(?:\.\d{3})+(?:,\d+)?|\d+(?:,\d+)?")
+# Thousands separator: '.' (Danish) or ',' (English sheet locale) followed by
+# exactly three digits. Decimals: ',' followed by one or two digits.
+_NUMBER_RE = re.compile(r"\d{1,3}(?:[.,]\d{3})+(?:,\d{1,2})?(?!\d)|\d+(?:,\d{1,2})?(?!\d)")
 
 
 def _to_int(num: str) -> int:
-    """'1.699' -> 1699, '1.699,50' -> 1700, '1699' -> 1699."""
-    whole, _, frac = num.partition(",")
-    value = int(whole.replace(".", ""))
+    """'1.699' -> 1699, '1,699' -> 1699, '1.699,50' -> 1700, '1699' -> 1699."""
+    m = re.fullmatch(r"(.*?)(?:,(\d{1,2}))?", num)
+    whole, frac = m.group(1), m.group(2)
+    value = int(whole.replace(".", "").replace(",", ""))
     if frac and int(frac[0]) >= 5:
         value += 1
     return value
@@ -83,11 +86,12 @@ def format_dkk(value: int) -> str:
     return f"{value:,}".replace(",", ".") + ",-"
 
 
-def parse_paste(text: str) -> list[Label]:
-    return parse_rows(csv.reader(io.StringIO(text.strip("\r\n")), delimiter="\t"))
+def parse_paste(text: str, per_stk: bool = False) -> list[Label]:
+    return parse_rows(csv.reader(io.StringIO(text.strip("\r\n")), delimiter="\t"), per_stk)
 
 
-def parse_rows(rows) -> list[Label]:
+def parse_rows(rows, per_stk: bool = False) -> list[Label]:
+    """per_stk: STK is only validated when one label per piece is printed."""
     labels = []
     for line_no, row in enumerate(rows, start=1):
         row = ["" if cell is None else str(cell) for cell in row]
@@ -110,7 +114,7 @@ def parse_rows(rows) -> list[Label]:
                              (navn, COL_NAVN, "mangler varenavn"),
                              (vejl is not None, COL_VEJL, "mangler vejl. pris"),
                              (pris is not None, COL_PRIS, "mangler pris pr stk"),
-                             (stk >= 1, COL_STK, "STK skal være mindst 1")]:
+                             (stk >= 1 or not per_stk, COL_STK, "STK skal være mindst 1")]:
             if not ok:
                 problems.append(msg)
                 bad_cols.append(col)
@@ -118,8 +122,11 @@ def parse_rows(rows) -> list[Label]:
     return labels
 
 
-def expand(labels: list[Label]) -> list[Label]:
-    """One entry per physical label (STK = 2 -> two labels)."""
+def expand(labels: list[Label], per_stk: bool = False) -> list[Label]:
+    """One entry per physical label: one per row by default, or one per
+    piece when per_stk is set (STK = 2 -> two labels)."""
+    if not per_stk:
+        return list(labels)
     return [lab for lab in labels for _ in range(lab.stk)]
 
 
@@ -419,13 +426,14 @@ def default_layout() -> str:
     return saved if saved in LAYOUTS else DEFAULT_LAYOUT
 
 
-def build_pdf(labels: list[Label], path, layout: str = DEFAULT_LAYOUT) -> int:
+def build_pdf(labels: list[Label], path, layout: str = DEFAULT_LAYOUT,
+              per_stk: bool = False) -> int:
     """Write the PDF; returns the number of pages."""
     register_fonts()
     draw = LAYOUTS[layout][1]
     page_w, page_h = A4
     half = page_h / 2
-    items = expand(labels)
+    items = expand(labels, per_stk)
     c = canvas.Canvas(str(path), pagesize=A4)
     c.setTitle("Etiketter")
     # Ask PDF viewers to default the print dialog to "Actual size" instead of
@@ -507,6 +515,7 @@ class LabelPrinterApp:
         self.save_dir = str(Path.home() / "Desktop")
         self._validate_job = self._preview_job = None
         self._problem_targets = []
+        self.per_stk_var = tk.BooleanVar(value=False)   # default: one label per row
 
         root.title(f"Label Printer {APP_VERSION}")
         root.geometry("1360x800")
@@ -598,6 +607,19 @@ class LabelPrinterApp:
         self.sheet.highlight_columns(unused, fg=C["faint"], redraw=False)
         for col in USED_COLS:  # the columns that end up on the label stand out
             self.sheet.highlight_cells(column=col, canvas="header", fg=C["accent"], redraw=False)
+        self._style_stk_column()
+
+    def _style_stk_column(self):
+        """STK only counts as a 'used' column while one label per piece is on."""
+        if self.per_stk:
+            # dehighlight_columns also clears the header, so it must come first
+            self.sheet.dehighlight_columns([COL_STK], redraw=False)
+            self.sheet.highlight_cells(column=COL_STK, canvas="header", fg=C["accent"],
+                                       redraw=False)
+        else:
+            self.sheet.highlight_cells(column=COL_STK, canvas="header", fg=C["faint"],
+                                       redraw=False)
+            self.sheet.highlight_columns([COL_STK], fg=C["faint"], redraw=False)
         self.sheet.refresh()
 
     def _build_sidebar(self, parent):
@@ -645,11 +667,9 @@ class LabelPrinterApp:
         self.preview = tk.Label(side, bg=C["table"], fg=C["muted"], font=(UI_FONT, 10),
                                 height=12, text="Ingen gyldige rækker endnu.")
         self.preview.grid(row=5, column=0, sticky="new")
-        label(side, text="Klik på en række for at se dens etiket.", fg=C["faint"],
-              font=(UI_FONT, 9)).grid(row=6, column=0, sticky="ew", pady=(6, 0))
 
         layout_row = tk.Frame(side, bg=C["card"])
-        layout_row.grid(row=7, column=0, sticky="ew", pady=(14, 0))
+        layout_row.grid(row=7, column=0, sticky="ew", pady=(12, 0))
         layout_row.columnconfigure(1, weight=1)
         label(layout_row, text="LAYOUT", fg=C["muted"], font=(UI_FONT, 9, "bold")
               ).grid(row=0, column=0, sticky="w", padx=(0, 12))
@@ -665,11 +685,18 @@ class LabelPrinterApp:
         self.default_btn.grid(row=1, column=1, sticky="e", pady=(4, 0))
         self.default_btn.bind("<Button-1>", lambda e: self._make_default())
         self._update_default_button()
-        side.rowconfigure(8, weight=1)
+
+        tk.Checkbutton(
+            side, variable=self.per_stk_var, command=self._toggle_per_stk,
+            text="Én etiket pr. stk (brug STK-kolonnen)", anchor="w",
+            bg=C["card"], fg=C["fg"], activebackground=C["card"], activeforeground=C["fg"],
+            selectcolor=C["table"], highlightthickness=0, bd=0, font=(UI_FONT, 10),
+            cursor="hand2").grid(row=8, column=0, sticky="ew", pady=(4, 0))
+        side.rowconfigure(9, weight=1)
 
         self.generate_btn = self.ttk.Button(side, text="Generér PDF", style="Big.Accent.TButton",
                                             command=self.generate)
-        self.generate_btn.grid(row=9, column=0, sticky="ew")
+        self.generate_btn.grid(row=10, column=0, sticky="ew")
 
     @staticmethod
     def _blank_rows(n):
@@ -708,7 +735,7 @@ class LabelPrinterApp:
 
     def validate(self):
         self._validate_job = None
-        self.labels = parse_rows(self.sheet.get_sheet_data())
+        self.labels = parse_rows(self.sheet.get_sheet_data(), self.per_stk)
         bad = [lab for lab in self.labels if lab.problems]
 
         new_cells = {(lab.line - 1, col) for lab in bad for col in lab.bad_cols}
@@ -726,7 +753,7 @@ class LabelPrinterApp:
         self.bad_cells, self.bad_rows = new_cells, new_rows
         self.sheet.refresh()
 
-        n = len(expand(self.labels))
+        n = len(expand(self.labels, self.per_stk))
         self.stat_vars["rows"].set(str(len(self.labels)))
         self.stat_vars["labels"].set(str(n))
         self.stat_vars["pages"].set(str((n + 1) // 2))
@@ -805,6 +832,14 @@ class LabelPrinterApp:
         self._update_default_button()
 
     @property
+    def per_stk(self):
+        return bool(self.per_stk_var.get())
+
+    def _toggle_per_stk(self):
+        self._style_stk_column()
+        self.validate()
+
+    @property
     def layout(self):
         return self.layout_names.get(self.layout_var.get(), DEFAULT_LAYOUT)
 
@@ -817,7 +852,7 @@ class LabelPrinterApp:
         if not path:
             return
         try:
-            pages = build_pdf(self.labels, path, self.layout)
+            pages = build_pdf(self.labels, path, self.layout, self.per_stk)
         except PermissionError:
             messagebox.showerror("Label Printer",
                                  "Kunne ikke gemme filen – er den åben i en PDF-læser?")
@@ -839,18 +874,20 @@ def main():
     parser.add_argument("--paste", help="tab-separated file with pasted rows (skips the GUI)")
     parser.add_argument("--out", default="etiketter.pdf")
     parser.add_argument("--layout", default=None, choices=list(LAYOUTS))
+    parser.add_argument("--per-stk", action="store_true",
+                        help="one label per piece (STK) instead of one per row")
     args = parser.parse_args()
     if not args.paste:
         run_gui()
         return
-    labels = parse_paste(Path(args.paste).read_text(encoding="utf-8"))
+    labels = parse_paste(Path(args.paste).read_text(encoding="utf-8"), args.per_stk)
     bad = [lab for lab in labels if lab.problems]
     for lab in bad:
         print(f"linje {lab.line}: {', '.join(lab.problems)}", file=sys.stderr)
     if bad:
         sys.exit(1)
-    pages = build_pdf(labels, args.out, args.layout or default_layout())
-    print(f"{len(expand(labels))} etiketter, {pages} sider -> {args.out}")
+    pages = build_pdf(labels, args.out, args.layout or default_layout(), args.per_stk)
+    print(f"{len(expand(labels, args.per_stk))} etiketter, {pages} sider -> {args.out}")
 
 
 if __name__ == "__main__":
