@@ -12,6 +12,7 @@ Usage:
 import argparse
 import csv
 import io
+import json
 import os
 import re
 import sys
@@ -35,6 +36,7 @@ MIN_COLS = COL_PRIS + 1
 
 DRAW_CUT_LINE = True
 DISCLAIMER = "KØBT SOM BESET, UDEN RETURRET!"
+APP_VERSION = "3.1"   # also shown in the installer (build/installer-label-printer.iss)
 
 
 @dataclass
@@ -216,11 +218,17 @@ def draw_label_classic(c, x, y, w, h, label: Label):
 def split_name(navn: str) -> tuple[str, str]:
     """'Balo spisebord, egetræ | butterfly udtræk | 190/290x95 Eg'
     -> ('Balo spisebord, egetræ', 'butterfly udtræk · 190/290x95 Eg').
-    Names without ' | ' have no reliable split point and stay whole."""
+    Without ' | ' the first ', ' is used instead:
+    'Palermo chaiselong sofa, venstrevendt Loop Mørk Beige'
+    -> ('Palermo chaiselong sofa', 'venstrevendt Loop Mørk Beige').
+    Names with neither stay whole."""
     parts = [p.strip() for p in navn.split("|") if p.strip()]
-    if len(parts) < 2:
-        return navn.strip(), ""
-    return parts[0], " · ".join(parts[1:])
+    if len(parts) >= 2:
+        return parts[0], " · ".join(parts[1:])
+    title, sep, details = navn.strip().partition(", ")
+    if sep and title.strip() and details.strip():
+        return title.strip(), details.strip()
+    return navn.strip(), ""
 
 
 def _fit_lines(text, font, size, min_size, width, max_lines=2):
@@ -389,7 +397,26 @@ LAYOUTS = {
     "modern": ("Moderne", draw_label_modern),
     "big_price": ("Stor pris", draw_label_big_price),
 }
-DEFAULT_LAYOUT = "classic"
+DEFAULT_LAYOUT = "classic"   # factory default; the GUI can save another one in settings
+
+SETTINGS_PATH = Path(os.environ.get("APPDATA", Path.home())) / "LabelPrinter" / "settings.json"
+
+
+def load_settings() -> dict:
+    try:
+        return json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(settings: dict):
+    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SETTINGS_PATH.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+
+
+def default_layout() -> str:
+    saved = load_settings().get("default_layout")
+    return saved if saved in LAYOUTS else DEFAULT_LAYOUT
 
 
 def build_pdf(labels: list[Label], path, layout: str = DEFAULT_LAYOUT) -> int:
@@ -401,6 +428,9 @@ def build_pdf(labels: list[Label], path, layout: str = DEFAULT_LAYOUT) -> int:
     items = expand(labels)
     c = canvas.Canvas(str(path), pagesize=A4)
     c.setTitle("Etiketter")
+    # Ask PDF viewers to default the print dialog to "Actual size" instead of
+    # "Fit to page", which would shrink the labels and move the cut line.
+    c.setViewerPreference("PrintScaling", "None")
     pages = 0
     for i in range(0, len(items), 2):
         pair = items[i:i + 2]
@@ -478,7 +508,7 @@ class LabelPrinterApp:
         self._validate_job = self._preview_job = None
         self._problem_targets = []
 
-        root.title("Label Printer")
+        root.title(f"Label Printer {APP_VERSION}")
         root.geometry("1360x800")
         root.minsize(1000, 620)
         try:
@@ -486,7 +516,7 @@ class LabelPrinterApp:
         except tk.TclError:
             pass
         root.configure(bg=C["bg"])
-        ico = Path(__file__).with_name("label_miner.ico")
+        ico = Path(__file__).with_name("label_printer.ico")
         if ico.exists():
             try:
                 root.iconbitmap(str(ico))
@@ -624,12 +654,17 @@ class LabelPrinterApp:
         label(layout_row, text="LAYOUT", fg=C["muted"], font=(UI_FONT, 9, "bold")
               ).grid(row=0, column=0, sticky="w", padx=(0, 12))
         self.layout_names = {name: key for key, (name, _) in LAYOUTS.items()}
-        self.layout_var = tk.StringVar(value=LAYOUTS[DEFAULT_LAYOUT][0])
+        self.layout_var = tk.StringVar(value=LAYOUTS[default_layout()][0])
         combo = self.ttk.Combobox(layout_row, textvariable=self.layout_var, state="readonly",
                                   values=list(self.layout_names))
         combo.grid(row=0, column=1, sticky="ew")
         combo.bind("<<ComboboxSelected>>", lambda e: (combo.selection_clear(),
+                                                      self._update_default_button(),
                                                       self._schedule_preview()))
+        self.default_btn = tk.Label(layout_row, bg=C["card"], font=(UI_FONT, 9), cursor="hand2")
+        self.default_btn.grid(row=1, column=1, sticky="e", pady=(4, 0))
+        self.default_btn.bind("<Button-1>", lambda e: self._make_default())
+        self._update_default_button()
         side.rowconfigure(8, weight=1)
 
         self.generate_btn = self.ttk.Button(side, text="Generér PDF", style="Big.Accent.TButton",
@@ -750,6 +785,25 @@ class LabelPrinterApp:
         self.preview_image = ImageTk.PhotoImage(image)
         self.preview.configure(image=self.preview_image, text="", height=0)
 
+    def _update_default_button(self):
+        if self.layout == default_layout():
+            self.default_btn.configure(text="✓ Standard-layout", fg=C["faint"], cursor="")
+        else:
+            self.default_btn.configure(text="Gør til standard", fg=C["accent"], cursor="hand2")
+
+    def _make_default(self):
+        if self.layout == default_layout():
+            return
+        settings = load_settings()
+        settings["default_layout"] = self.layout
+        try:
+            save_settings(settings)
+        except OSError as exc:
+            from tkinter import messagebox
+            messagebox.showerror("Label Printer", f"Kunne ikke gemme indstillingen:\n{exc}")
+            return
+        self._update_default_button()
+
     @property
     def layout(self):
         return self.layout_names.get(self.layout_var.get(), DEFAULT_LAYOUT)
@@ -784,7 +838,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--paste", help="tab-separated file with pasted rows (skips the GUI)")
     parser.add_argument("--out", default="etiketter.pdf")
-    parser.add_argument("--layout", default=DEFAULT_LAYOUT, choices=list(LAYOUTS))
+    parser.add_argument("--layout", default=None, choices=list(LAYOUTS))
     args = parser.parse_args()
     if not args.paste:
         run_gui()
@@ -795,7 +849,7 @@ def main():
         print(f"linje {lab.line}: {', '.join(lab.problems)}", file=sys.stderr)
     if bad:
         sys.exit(1)
-    pages = build_pdf(labels, args.out, args.layout)
+    pages = build_pdf(labels, args.out, args.layout or default_layout())
     print(f"{len(expand(labels))} etiketter, {pages} sider -> {args.out}")
 
 
