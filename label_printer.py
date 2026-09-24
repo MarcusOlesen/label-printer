@@ -15,7 +15,7 @@ import io
 import os
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 
@@ -46,6 +46,7 @@ class Label:
     stk: int
     line: int               # 1-based row number in the pasted text
     problems: list[str]
+    bad_cols: list[int] = field(default_factory=list)   # columns to highlight in the GUI
 
 
 # --------------------------------------------------------------------------
@@ -81,9 +82,13 @@ def format_dkk(value: int) -> str:
 
 
 def parse_paste(text: str) -> list[Label]:
+    return parse_rows(csv.reader(io.StringIO(text.strip("\r\n")), delimiter="\t"))
+
+
+def parse_rows(rows) -> list[Label]:
     labels = []
-    rows = csv.reader(io.StringIO(text.strip("\r\n")), delimiter="\t")
     for line_no, row in enumerate(rows, start=1):
+        row = ["" if cell is None else str(cell) for cell in row]
         if not any(cell.strip() for cell in row):
             continue
         if row[0].strip().lower() == "varenummer":
@@ -95,22 +100,19 @@ def parse_paste(text: str) -> list[Label]:
 
         varenr, navn = row[COL_VARENR], row[COL_NAVN]
         vejl, pris = parse_vejl(row[COL_VEJL]), parse_price(row[COL_PRIS])
-        try:
-            stk = int(parse_price(row[COL_STK]) or 1)
-        except ValueError:
-            stk = 1
+        stk = parse_price(row[COL_STK])
+        stk = 1 if stk is None else stk
 
-        if not varenr:
-            problems.append("mangler varenummer")
-        if not navn:
-            problems.append("mangler varenavn")
-        if vejl is None:
-            problems.append("mangler vejl. pris")
-        if pris is None:
-            problems.append("mangler pris pr stk")
-        if stk < 1:
-            problems.append("STK < 1")
-        labels.append(Label(varenr, navn, vejl, pris, stk, line_no, problems))
+        bad_cols = []
+        for ok, col, msg in [(varenr, COL_VARENR, "mangler varenummer"),
+                             (navn, COL_NAVN, "mangler varenavn"),
+                             (vejl is not None, COL_VEJL, "mangler vejl. pris"),
+                             (pris is not None, COL_PRIS, "mangler pris pr stk"),
+                             (stk >= 1, COL_STK, "STK skal være mindst 1")]:
+            if not ok:
+                problems.append(msg)
+                bad_cols.append(col)
+        labels.append(Label(varenr, navn, vejl, pris, stk, line_no, problems, bad_cols))
     return labels
 
 
@@ -243,94 +245,345 @@ def build_pdf(labels: list[Label], path, layout: str = "classic") -> int:
 
 
 # --------------------------------------------------------------------------
+# Preview rendering (optional: needs pypdfium2 + Pillow)
+# --------------------------------------------------------------------------
+
+def render_label_image(label: Label, width_px: int, layout: str = "classic"):
+    """One label as a PIL image, or None if pypdfium2 isn't installed."""
+    try:
+        import pypdfium2
+    except ImportError:
+        return None
+    register_fonts()
+    page_w, page_h = A4[0], A4[1] / 2
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=(page_w, page_h))
+    LAYOUTS[layout](c, 0, 0, page_w, page_h, label)
+    c.showPage()
+    c.save()
+    pdf = pypdfium2.PdfDocument(buf.getvalue())
+    return pdf[0].render(scale=width_px / page_w).to_pil()
+
+
+# --------------------------------------------------------------------------
 # GUI
 # --------------------------------------------------------------------------
 
-def run_gui():
-    import tkinter as tk
-    from tkinter import filedialog, messagebox, ttk
+SHEET_HEADERS = ["Varenummer", "Varenavn", "MK Varenummer", "MK ordrenr", "STAND", "STK",
+                 "Modtaget", "Vejl. priser", "Pris pr stk", "Pris samlet",
+                 "URL", "Image name"]
+USED_COLS = [COL_VARENR, COL_NAVN, COL_STK, COL_VEJL, COL_PRIS]
+COL_WIDTHS = {COL_VARENR: 100, COL_NAVN: 280, COL_STK: 45, COL_VEJL: 175, COL_PRIS: 90}
+UNUSED_COL_WIDTH = 45  # pasted but not printed: keep narrow so the prices stay in view
+EMPTY_ROWS = 40
 
-    root = tk.Tk()
-    root.title("Label Printer")
-    root.geometry("1000x700")
-    ico = Path(__file__).with_name("label_miner.ico")
-    if ico.exists():
+UI_FONT = "Segoe UI"
+C = {  # matches the sv-ttk dark theme used by Label Miner
+    "bg": "#1c1c1c", "card": "#262626", "table": "#202020", "header": "#2d2d2d",
+    "grid": "#3a3a3a", "fg": "#fafafa", "muted": "#8b8b8b", "faint": "#5f5f5f",
+    "accent": "#57c8ff", "ok": "#6fcf97", "bad": "#ff8a8a", "bad_bg": "#5a2828",
+    "select": "#1f4a63",
+}
+
+
+class LabelPrinterApp:
+    def __init__(self, root):
+        import tkinter as tk
+        from tkinter import ttk
+        from tksheet import Sheet
+
+        self.tk, self.ttk = tk, ttk
+        self.root = root
+        self.labels: list[Label] = []
+        self.bad_cells: set[tuple[int, int]] = set()
+        self.bad_rows: set[int] = set()
+        self.preview_image = None
+        self.save_dir = str(Path.home() / "Desktop")
+        self._validate_job = self._preview_job = None
+        self._problem_targets = []
+
+        root.title("Label Printer")
+        root.geometry("1360x800")
+        root.minsize(1000, 620)
         try:
-            root.iconbitmap(str(ico))
+            root.state("zoomed")  # the table benefits from all the room it can get
         except tk.TclError:
             pass
+        root.configure(bg=C["bg"])
+        ico = Path(__file__).with_name("label_miner.ico")
+        if ico.exists():
+            try:
+                root.iconbitmap(str(ico))
+            except tk.TclError:
+                pass
+        self._apply_theme()
 
-    state = {"labels": []}
+        # ---- header -------------------------------------------------------
+        header = ttk.Frame(root, padding=(20, 16, 20, 8))
+        header.pack(fill="x")
+        titles = ttk.Frame(header)
+        titles.pack(side="left")
+        ttk.Label(titles, text="Label Printer", font=(UI_FONT, 18, "bold")).pack(anchor="w")
+        ttk.Label(titles, foreground=C["muted"],
+                  text="Kopiér rækkerne i Google Sheets (marker fra kolonne A) og indsæt dem i "
+                       "tabellen med Ctrl+V. Du kan rette direkte i cellerne.").pack(anchor="w")
+        ttk.Button(header, text="Ryd tabel", command=self.clear).pack(side="right")
+        ttk.Button(header, text="Indsæt fra udklipsholder", command=self.paste_replace
+                   ).pack(side="right", padx=8)
 
-    ttk.Label(root, text="Indsæt rækker fra Google Sheets (marker fra kolonne A, uden overskrift):"
-              ).pack(anchor="w", padx=10, pady=(10, 2))
-    text_frame = ttk.Frame(root)
-    text_frame.pack(fill="both", expand=False, padx=10)
-    text = tk.Text(text_frame, height=10, wrap="none", undo=True)
-    text_scroll = ttk.Scrollbar(text_frame, command=text.yview)
-    text.configure(yscrollcommand=text_scroll.set)
-    text.pack(side="left", fill="both", expand=True)
-    text_scroll.pack(side="right", fill="y")
+        # ---- body: sheet + sidebar ---------------------------------------
+        body = ttk.Frame(root, padding=(20, 8, 20, 20))
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(0, weight=1)
 
-    buttons = ttk.Frame(root)
-    buttons.pack(fill="x", padx=10, pady=6)
-    status = tk.StringVar(value="Indsæt rækker og tryk 'Indlæs'.")
+        self.sheet = Sheet(
+            body, headers=SHEET_HEADERS, data=self._blank_rows(EMPTY_ROWS),
+            theme="dark", font=(UI_FONT, 10, "normal"), header_font=(UI_FONT, 10, "bold"),
+            index_font=(UI_FONT, 9, "normal"), default_row_height=28, default_header_height=34,
+            paste_can_expand_y=True, paste_can_expand_x=False, expand_sheet_if_paste_too_big=True,
+            show_selected_cells_border=True,
+        )
+        self._style_sheet()
+        self.sheet.enable_bindings("all")
+        self.sheet.disable_bindings("edit_header", "edit_index", "rename_columns")
+        self.sheet.grid(row=0, column=0, sticky="nsew")
+        self.sheet.bind("<<SheetModified>>", lambda e: self._schedule_validate())
+        self.sheet.bind("<<SheetSelect>>", lambda e: self._schedule_preview())
+        root.bind_all("<Control-v>", self._global_paste, add="+")
 
-    cols = ("linje", "varenr", "navn", "vejl", "pris", "antal", "fejl")
-    headings = ("#", "Varenr", "Varenavn", "Vejl. pris", "Vores pris", "Antal", "Problemer")
-    widths = (40, 80, 420, 90, 90, 50, 200)
-    tree_frame = ttk.Frame(root)
-    tree_frame.pack(fill="both", expand=True, padx=10)
-    tree = ttk.Treeview(tree_frame, columns=cols, show="headings")
-    for col, head, wid in zip(cols, headings, widths):
-        tree.heading(col, text=head)
-        tree.column(col, width=wid, anchor="w", stretch=(col == "navn"))
-    tree.tag_configure("bad", background="#f8d0d0")
-    tree_scroll = ttk.Scrollbar(tree_frame, command=tree.yview)
-    tree.configure(yscrollcommand=tree_scroll.set)
-    tree.pack(side="left", fill="both", expand=True)
-    tree_scroll.pack(side="right", fill="y")
+        self._build_sidebar(body)
+        self.sheet.select_cell(0, 0)
+        self.sheet.focus_set()
+        self.validate()
 
-    ttk.Label(root, textvariable=status).pack(anchor="w", padx=10, pady=(4, 10))
+    # ---- setup -----------------------------------------------------------
+    def _apply_theme(self):
+        ttk = self.ttk
+        try:
+            import sv_ttk
+            sv_ttk.set_theme("dark")
+        except ImportError:
+            pass
+        self.root.option_add("*Font", (UI_FONT, 10))
+        style = ttk.Style(self.root)
+        style.configure(".", font=(UI_FONT, 10))
+        style.configure("Big.Accent.TButton", font=(UI_FONT, 12, "bold"), padding=(20, 12))
 
-    def load():
-        labels = parse_paste(text.get("1.0", "end"))
-        state["labels"] = labels
-        tree.delete(*tree.get_children())
-        for lab in labels:
-            tree.insert("", "end", tags=("bad",) if lab.problems else (), values=(
-                lab.line, lab.varenr, lab.navn,
-                format_dkk(lab.vejl) if lab.vejl is not None else "",
-                format_dkk(lab.pris) if lab.pris is not None else "",
-                lab.stk, ", ".join(lab.problems)))
-        bad = sum(1 for lab in labels if lab.problems)
-        n = len(expand(labels))
-        msg = f"{len(labels)} rækker → {n} etiketter → {(n + 1) // 2} sider"
-        if bad:
-            msg += f"   ⚠ {bad} rækker har problemer og skal rettes i arket først"
-        status.set(msg)
-        gen_btn.state(["!disabled"] if labels and not bad else ["disabled"])
+    def _style_sheet(self):
+        options = dict(
+            frame_bg=C["bg"], table_bg=C["table"], table_fg=C["fg"], table_grid_fg=C["grid"],
+            header_bg=C["header"], header_fg=C["muted"], header_grid_fg=C["grid"],
+            header_border_fg=C["grid"], index_bg=C["header"], index_fg=C["muted"],
+            index_grid_fg=C["grid"], index_border_fg=C["grid"], top_left_bg=C["header"],
+            top_left_fg=C["header"], table_selected_cells_bg=C["select"],
+            table_selected_cells_border_fg=C["accent"], header_selected_cells_bg=C["select"],
+            header_selected_cells_fg=C["fg"], index_selected_cells_bg=C["select"],
+            index_selected_cells_fg=C["fg"], table_editor_bg=C["card"], table_editor_fg=C["fg"],
+        )
+        for key, value in options.items():  # tolerate option names changing between versions
+            try:
+                self.sheet.set_options(**{key: value}, redraw=False)
+            except Exception:
+                pass
+        for col in range(len(SHEET_HEADERS)):
+            self.sheet.column_width(col, COL_WIDTHS.get(col, UNUSED_COL_WIDTH), redraw=False)
+        unused = [c for c in range(len(SHEET_HEADERS)) if c not in USED_COLS]
+        self.sheet.highlight_columns(unused, fg=C["faint"], redraw=False)
+        for col in USED_COLS:  # the columns that end up on the label stand out
+            self.sheet.highlight_cells(column=col, canvas="header", fg=C["accent"], redraw=False)
+        self.sheet.refresh()
 
-    def generate():
+    def _build_sidebar(self, parent):
+        # Plain tk widgets here: sv-ttk draws ttk frames/labels with images and
+        # ignores custom backgrounds, which leaves grey patches on the card.
+        tk = self.tk
+        side = tk.Frame(parent, bg=C["card"], width=370, padx=18, pady=14,
+                        highlightthickness=1, highlightbackground=C["grid"])
+        side.grid(row=0, column=1, sticky="nsew", padx=(16, 0))
+        side.grid_propagate(False)
+        side.columnconfigure(0, weight=1)
+
+        def label(parent, **kw):
+            kw.setdefault("bg", C["card"])
+            kw.setdefault("fg", C["fg"])
+            kw.setdefault("font", (UI_FONT, 10))
+            return tk.Label(parent, anchor="w", justify="left", **kw)
+
+        stats = tk.Frame(side, bg=C["card"])
+        stats.grid(row=0, column=0, sticky="ew")
+        self.stat_vars = {}
+        for i, (key, caption) in enumerate([("rows", "rækker"), ("labels", "etiketter"),
+                                            ("pages", "sider")]):
+            stats.columnconfigure(i, weight=1, uniform="stat")
+            var = tk.StringVar(value="0")
+            self.stat_vars[key] = var
+            label(stats, textvariable=var, font=(UI_FONT, 22, "bold"),
+                  fg=C["accent"] if key == "labels" else C["fg"]).grid(row=0, column=i, sticky="w")
+            label(stats, text=caption, fg=C["muted"], font=(UI_FONT, 9)
+                  ).grid(row=1, column=i, sticky="w")
+
+        tk.Frame(side, bg=C["grid"], height=1).grid(row=1, column=0, sticky="ew", pady=12)
+
+        self.status_label = label(side, font=(UI_FONT, 11, "bold"), wraplength=340)
+        self.status_label.grid(row=2, column=0, sticky="ew")
+        self.problem_list = tk.Listbox(
+            side, height=3, activestyle="none", borderwidth=0, highlightthickness=0,
+            bg=C["card"], fg=C["bad"], selectbackground=C["select"], selectforeground=C["fg"],
+            font=(UI_FONT, 10), cursor="hand2")
+        self.problem_list.grid(row=3, column=0, sticky="ew", pady=(6, 0))
+        self.problem_list.bind("<<ListboxSelect>>", self._jump_to_problem)
+
+        self.preview_title = label(side, fg=C["muted"], font=(UI_FONT, 9, "bold"))
+        self.preview_title.grid(row=4, column=0, sticky="ew", pady=(10, 6))
+        self.preview = tk.Label(side, bg=C["table"], fg=C["muted"], font=(UI_FONT, 10),
+                                height=12, text="Ingen gyldige rækker endnu.")
+        self.preview.grid(row=5, column=0, sticky="new")
+        label(side, text="Klik på en række for at se dens etiket.", fg=C["faint"],
+              font=(UI_FONT, 9)).grid(row=6, column=0, sticky="ew", pady=(6, 0))
+        side.rowconfigure(7, weight=1)
+
+        self.generate_btn = self.ttk.Button(side, text="Generér PDF", style="Big.Accent.TButton",
+                                            command=self.generate)
+        self.generate_btn.grid(row=8, column=0, sticky="ew")
+
+    @staticmethod
+    def _blank_rows(n):
+        return [[""] * len(SHEET_HEADERS) for _ in range(n)]
+
+    # ---- pasting ---------------------------------------------------------
+    def paste_replace(self):
+        """Replace the whole table with the clipboard contents."""
+        try:
+            text = self.root.clipboard_get()
+        except self.tk.TclError:
+            return
+        rows = [(row + [""] * len(SHEET_HEADERS))[:len(SHEET_HEADERS)]
+                for row in csv.reader(io.StringIO(text.strip("\r\n")), delimiter="\t")]
+        rows += self._blank_rows(max(0, EMPTY_ROWS - len(rows)))
+        self.sheet.set_sheet_data(rows, reset_col_positions=False)
+        self.sheet.select_cell(0, 0)
+        self.validate()
+
+    def _global_paste(self, event):
+        # tksheet handles Ctrl+V itself when a cell is selected; otherwise
+        # (focus on a button, nothing selected) paste the whole clipboard.
+        if not self.sheet.get_currently_selected():
+            self.paste_replace()
+
+    def clear(self):
+        self.sheet.set_sheet_data(self._blank_rows(EMPTY_ROWS), reset_col_positions=False)
+        self.sheet.select_cell(0, 0)
+        self.validate()
+
+    # ---- validation ------------------------------------------------------
+    def _schedule_validate(self):
+        if self._validate_job:
+            self.root.after_cancel(self._validate_job)
+        self._validate_job = self.root.after(120, self.validate)
+
+    def validate(self):
+        self._validate_job = None
+        self.labels = parse_rows(self.sheet.get_sheet_data())
+        bad = [lab for lab in self.labels if lab.problems]
+
+        new_cells = {(lab.line - 1, col) for lab in bad for col in lab.bad_cols}
+        new_rows = {lab.line - 1 for lab in bad}
+        stale = self.bad_cells - new_cells
+        if stale:
+            self.sheet.dehighlight_cells(cells=list(stale), redraw=False)
+        for row in self.bad_rows - new_rows:
+            self.sheet.dehighlight_cells(row=row, canvas="index", redraw=False)
+        if new_cells:
+            self.sheet.highlight_cells(cells=list(new_cells), bg=C["bad_bg"], redraw=False)
+        for row in new_rows:
+            self.sheet.highlight_cells(row=row, canvas="index", bg=C["bad_bg"], fg=C["fg"],
+                                       redraw=False)
+        self.bad_cells, self.bad_rows = new_cells, new_rows
+        self.sheet.refresh()
+
+        n = len(expand(self.labels))
+        self.stat_vars["rows"].set(str(len(self.labels)))
+        self.stat_vars["labels"].set(str(n))
+        self.stat_vars["pages"].set(str((n + 1) // 2))
+
+        self.problem_list.delete(0, "end")
+        self._problem_targets = []
+        for lab in bad:
+            self.problem_list.insert("end", f"Række {lab.line}:  {', '.join(lab.problems)}")
+            self._problem_targets.append((lab.line - 1, lab.bad_cols[0] if lab.bad_cols else 0))
+
+        if not self.labels:
+            self._set_status("Indsæt rækker for at komme i gang.", C["muted"])
+        elif bad:
+            self._set_status(f"{len(bad)} række{'r' if len(bad) > 1 else ''} skal rettes:", C["bad"])
+        else:
+            self._set_status("✓  Klar til udskrift", C["ok"])
+        self.generate_btn.state(["!disabled"] if self.labels and not bad else ["disabled"])
+        self._schedule_preview()
+
+    def _set_status(self, text, color):
+        self.status_label.configure(text=text, fg=color)
+
+    def _jump_to_problem(self, _event):
+        sel = self.problem_list.curselection()
+        if not sel:
+            return
+        row, col = self._problem_targets[sel[0]]
+        self.sheet.see(row, col)
+        self.sheet.select_cell(row, col)
+        self.sheet.focus_set()
+
+    # ---- preview ---------------------------------------------------------
+    def _schedule_preview(self):
+        if self._preview_job:
+            self.root.after_cancel(self._preview_job)
+        self._preview_job = self.root.after(80, self.update_preview)
+
+    def update_preview(self):
+        self._preview_job = None
+        selected = self.sheet.get_currently_selected()
+        row = selected.row if selected else None
+        by_row = {lab.line - 1: lab for lab in self.labels}
+        label = by_row.get(row)
+        if label is None or label.problems:
+            label = next((lab for lab in self.labels if not lab.problems), None)
+        if label is None:
+            self.preview.configure(image="", text="Ingen gyldige rækker endnu.", height=12)
+            self.preview_title.configure(text="FORHÅNDSVISNING")
+            return
+        self.preview_title.configure(text=f"FORHÅNDSVISNING  ·  RÆKKE {label.line}")
+        image = render_label_image(label, 330)
+        if image is None:
+            self.preview.configure(image="", text="Installer pypdfium2 for forhåndsvisning.")
+            return
+        from PIL import ImageTk
+        self.preview_image = ImageTk.PhotoImage(image)
+        self.preview.configure(image=self.preview_image, text="", height=0)
+
+    # ---- output ----------------------------------------------------------
+    def generate(self):
+        from tkinter import filedialog, messagebox
         path = filedialog.asksaveasfilename(
-            defaultextension=".pdf", filetypes=[("PDF", "*.pdf")],
+            defaultextension=".pdf", filetypes=[("PDF", "*.pdf")], initialdir=self.save_dir,
             initialfile=f"etiketter_{date.today():%Y-%m-%d}.pdf")
         if not path:
             return
         try:
-            pages = build_pdf(state["labels"], path)
+            pages = build_pdf(self.labels, path)
         except PermissionError:
-            messagebox.showerror("Label Printer", "Kunne ikke gemme filen -- er den åben i en PDF-læser?")
+            messagebox.showerror("Label Printer",
+                                 "Kunne ikke gemme filen – er den åben i en PDF-læser?")
             return
-        status.set(f"Gemt {pages} sider: {path}")
+        self.save_dir = str(Path(path).parent)
+        self._set_status(f"✓  Gemt {pages} sider: {Path(path).name}", C["ok"])
         os.startfile(path)
 
-    ttk.Button(buttons, text="Indlæs", command=load).pack(side="left")
-    ttk.Button(buttons, text="Ryd", command=lambda: text.delete("1.0", "end")).pack(side="left", padx=6)
-    gen_btn = ttk.Button(buttons, text="Generér PDF", command=generate, state="disabled")
-    gen_btn.pack(side="right")
 
-    text.focus_set()
+def run_gui():
+    import tkinter as tk
+    root = tk.Tk()
+    LabelPrinterApp(root)
     root.mainloop()
 
 
