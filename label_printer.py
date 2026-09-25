@@ -36,7 +36,7 @@ MIN_COLS = COL_PRIS + 1
 
 DRAW_CUT_LINE = False   # default for the "Skærelinje i midten" checkbox
 DISCLAIMER = "KØBT SOM BESET, UDEN RETURRET!"
-APP_VERSION = "4.2"   # also shown in the installer (build/installer-label-printer.iss)
+APP_VERSION = "4.3"   # also shown in the installer (build/installer-label-printer.iss)
 MANUAL_NAME = "Label-Printer-Vejledning.pdf"   # built by build/manual/make_manual.py
 
 
@@ -80,8 +80,14 @@ def _to_int(num: str) -> int:
 _SPACE_THOUSANDS_RE = re.compile(r"(?<![\d.,])(\d{1,2})[  ](\d{3})(?![\d])")
 
 
+# Small fractions like 'del 1/3' or '2/2' are never prices; drop them before
+# reading numbers, otherwise 'OBS: delvis vare (del 1/3)' gives vejl. pris 3.
+_FRACTION_RE = re.compile(r"(?<![\d.,])\d{1,2} ?/ ?\d{1,2}(?![\d.,])")
+
+
 def _numbers(text: str) -> list[int]:
-    text = _SPACE_THOUSANDS_RE.sub(r"\1\2", text or "")
+    text = _FRACTION_RE.sub(" ", text or "")
+    text = _SPACE_THOUSANDS_RE.sub(r"\1\2", text)
     return [_to_int(n) for n in _NUMBER_RE.findall(text)]
 
 
