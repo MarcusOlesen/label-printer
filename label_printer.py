@@ -36,7 +36,8 @@ MIN_COLS = COL_PRIS + 1
 
 DRAW_CUT_LINE = False   # default for the "Skærelinje i midten" checkbox
 DISCLAIMER = "KØBT SOM BESET, UDEN RETURRET!"
-APP_VERSION = "4.1"   # also shown in the installer (build/installer-label-printer.iss)
+APP_VERSION = "4.2"   # also shown in the installer (build/installer-label-printer.iss)
+MANUAL_NAME = "Label-Printer-Vejledning.pdf"   # built by build/manual/make_manual.py
 
 
 @dataclass
@@ -572,6 +573,8 @@ class LabelPrinterApp:
         # text, never the buttons.
         buttons = ttk.Frame(header)
         buttons.pack(side="right", anchor="n")
+        ttk.Button(buttons, text="?  Hjælp", command=self.open_manual
+                   ).pack(side="left", padx=(0, 8))
         ttk.Button(buttons, text="Indsæt fra udklipsholder", command=self.paste_replace
                    ).pack(side="left", padx=(0, 8))
         ttk.Button(buttons, text="Ryd tabel", command=self.clear).pack(side="left")
@@ -773,6 +776,17 @@ class LabelPrinterApp:
         return [[""] * len(SHEET_HEADERS) for _ in range(n)]
 
     # ---- pasting ---------------------------------------------------------
+    def open_manual(self):
+        """Opens the PDF manual: next to the .exe when installed, next to the
+        script when run from source."""
+        for folder in (Path(sys.executable).parent, Path(__file__).resolve().parent):
+            manual = folder / MANUAL_NAME
+            if manual.exists():
+                os.startfile(manual)
+                return
+        from tkinter import messagebox
+        messagebox.showinfo("Label Printer", f"Vejledningen ({MANUAL_NAME}) blev ikke fundet.")
+
     def paste_replace(self):
         """Replace the whole table with the clipboard contents."""
         try:
