@@ -36,7 +36,7 @@ MIN_COLS = COL_PRIS + 1
 
 DRAW_CUT_LINE = False   # default for the "Skærelinje i midten" checkbox
 DISCLAIMER = "KØBT SOM BESET, UDEN RETURRET!"
-APP_VERSION = "4.0"   # also shown in the installer (build/installer-label-printer.iss)
+APP_VERSION = "4.1"   # also shown in the installer (build/installer-label-printer.iss)
 
 
 @dataclass
@@ -59,7 +59,8 @@ class Label:
 
 # Thousands separator: '.' (Danish) or ',' (English sheet locale) followed by
 # exactly three digits. Decimals: ',' followed by one or two digits.
-_NUMBER_RE = re.compile(r"\d{1,3}(?:[.,]\d{3})+(?:,\d{1,2})?(?!\d)|\d+(?:,\d{1,2})?(?!\d)")
+_NUMBER_RE = re.compile(
+    r"(?<!\d)(?:\d{1,3}(?:[.,]\d{3})+(?:,\d{1,2})?(?!\d)|\d+(?:,\d{1,2})?(?!\d))")
 
 
 def _to_int(num: str) -> int:
@@ -72,15 +73,27 @@ def _to_int(num: str) -> int:
     return value
 
 
+# A space is a thousands separator only after a 1-2 digit group followed by
+# exactly three digits ('1 000', '10 499'); prices never reach 100.000. Any
+# other space separates two numbers: '1234 4321', '899 999'.
+_SPACE_THOUSANDS_RE = re.compile(r"(?<![\d.,])(\d{1,2})[  ](\d{3})(?![\d])")
+
+
+def _numbers(text: str) -> list[int]:
+    text = _SPACE_THOUSANDS_RE.sub(r"\1\2", text or "")
+    return [_to_int(n) for n in _NUMBER_RE.findall(text)]
+
+
 def parse_price(text: str) -> int | None:
     """First number in a cell like '1.000 kr' / '~1000' / '1.000,00'."""
-    m = _NUMBER_RE.search((text or "").replace(" ", ""))
-    return _to_int(m.group(0)) if m else None
+    nums = _numbers(text)
+    return nums[0] if nums else None
 
 
 def parse_vejl(text: str) -> int | None:
-    """Highest number in the recommended-price column: '8.999 kr (11.999 kr)' -> 11999."""
-    nums = [_to_int(n) for n in _NUMBER_RE.findall((text or "").replace(" ", ""))]
+    """Highest number in the recommended-price column: '8.999 kr (11.999 kr)' -> 11999,
+    '1234 4321' -> 4321 (same as '1234 (4321)')."""
+    nums = _numbers(text)
     return max(nums) if nums else None
 
 
