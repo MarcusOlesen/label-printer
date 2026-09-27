@@ -1,0 +1,8 @@
+# Pinned versions of a known-good environment, used for the Windows build.
+# Development: pip install -e .[dev]
+reportlab==5.0.1
+tksheet==7.6.0
+pypdfium2==5.13.0
+pillow==12.3.0
+sv_ttk==2.6.1
+pyinstaller==6.22.2
