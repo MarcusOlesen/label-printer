@@ -6,7 +6,7 @@ to be cut in half.
 
 ![Label Printer with pasted rows, a live preview and the layout options](docs/images/label-printer.png)
 
-It is the second half of a two-step workflow. **Label Miner** (a separate repository) reads the labels
+It is the second half of a two-step workflow. [Label Miner](https://github.com/MarcusOlesen/label-miner) reads the labels
 on photos of incoming items and fills the shop's Google Sheet; Label Printer prints the price labels
 from that sheet.
 
